@@ -1,0 +1,480 @@
+---
+title: "LPS853 CRISPR screen: drug vs DMSO analysis"
+output: html_document: true
+   
+---
+
+```{r setup, include=FALSE}
+# Define paths
+root_dir <- rprojroot::find_root(rprojroot::has_dir("LPS853_Brunello"))
+analysis_dir <- file.path(root_dir, "LPS853_Brunello")
+plots_dir <- file.path(root_dir, "LPS853_Brunello", "Plot_MAGecK")
+
+# Create directories if they don't exist
+if (!dir.exists(plots_dir)) {dir.create(plots_dir, recursive = TRUE)}
+if (!dir.exists(analysis_dir)) {dir.create(analysis_dir, recursive = TRUE)}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4.5, dpi = 150)
+```
+
+# Overview
+
+The data are read counts from a Brunello genome-wide screen in LPS853 cells:
+* about 19,000 genes with 4 sgRNAs each, plus 1,000 non-targeting guides
+* one sample per condition: T0, DMSO, Palbociclib, Doxorubicin and Nutlin-3a (no replicates)
+
+# 0. Packages and parameters
+
+```{r packages}
+# install.packages(c("readxl","MASS","dplyr","ggplot2","ggrepel","patchwork","pROC","openxlsx"))
+library(readxl)
+library(MASS)       # rlm() for the robust growth-correction fit
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(pROC)
+library(openxlsx)
+
+xlsx_file   <- file.path(root_dir,"can-25-1858_supplementary_table_s4_suppst4.xlsx")  # path to excel sheet readcounts
+min_T0      <- 30     # drop sgRNAs with fewer than this many reads at T0
+sd_window   <- 1001   # sgRNAs per sliding window for abundance-matched SD
+fdr_cut     <- 0.1
+set.seed(1)
+
+col_sens <- "#2a6fdb"; col_res <- "#d9661f"; col_ns <- "grey75"
+theme_set(theme_classic(base_size = 10))
+```
+
+# 1. Load data
+
+The count sheet has a title row, so the header is on row 2 (`skip = 1`).
+
+```{r load}
+counts <- read_excel(xlsx_file, sheet = "Readcounts CRISPR screens", skip = 1)
+counts <- as.data.frame(counts)
+samples <- c("LPS853_T0", "LPS853_Ctrl", "LPS853_Palbo", "LPS853_Dox", "LPS853_Nut")
+counts[samples] <- lapply(counts[samples], as.numeric)
+dim(counts)
+head(counts)
+
+# Paper MAGeCK gene scores (for comparison)
+mageck <- as.data.frame(read_excel(xlsx_file, sheet = "MAGeCK output"))
+
+# Reference essential / non-essential genes (Hart et al.)
+ref <- read_excel(xlsx_file, sheet = "(Non-) essential gene lists")
+essential    <- na.omit(ref[["Essential genes"]])
+nonessential <- na.omit(ref[["Non-essential genes"]])
+c(essential = length(essential), nonessential = length(nonessential))
+
+is_nt <- counts$gene == "NonTargeting"
+table(is_nt)
+```
+
+# 2. Library-level QC and normalisation
+
+## 2.1 Raw count summary
+
+```{r rawqc}
+gini <- function(x) {
+  x <- sort(x); n <- length(x)
+  sum((2 * seq_len(n) - n - 1) * x) / (n * sum(x))
+}
+qc_tab <- data.frame(
+  sample        = samples,
+  total_reads   = sapply(counts[samples], sum),
+  median_reads  = sapply(counts[samples], median),
+  zero_sgRNAs   = sapply(counts[samples], function(x) sum(x == 0)),
+  gini          = round(sapply(counts[samples], gini), 3)
+)
+qc_tab
+```
+
+A Gini index around 0.1–0.2 at T0 is ideal and anything below about 0.35 is acceptable. A rise
+after selection is expected, because essential-gene guides drop out.
+
+## 2.2 Median-ratio normalisation
+
+```{r norm}
+cnt <- as.matrix(counts[samples])
+lg  <- log(cnt); lg[!is.finite(lg)] <- NA          # zero counts are excluded from the geometric mean
+geo <- rowMeans(lg)                                # per-sgRNA log geometric mean
+size_factors <- exp(apply(lg - geo, 2, median, na.rm = TRUE))
+round(size_factors, 3)
+
+norm <- sweep(cnt, 2, size_factors, "/")
+L    <- log2(norm + 1)                             # log2 normalised counts
+```
+
+## 2.3 Sample correlation
+
+```{r corr}
+round(cor(L), 3)
+```
+
+The drug arms correlate with DMSO at r ≈ 0.985, so the drug effects are subtle. All
+four selected samples correlate less with T0 (r ≈ 0.84–0.87).
+
+## 2.4 Essential-gene dropout: ROC / AUC and NNMD
+
+If the screen worked, essential genes should be depleted relative to non-essential genes in every
+arm compared with T0. For each arm we compute gene-level mean log2FC vs T0 (centred on non-targeting
+guides), then the ROC AUC and NNMD. NNMD is the difference between essential and non-essential means,
+divided by the non-essential SD; values below −2 are good and below −3 are excellent.
+
+```{r auc}
+gene_lfc_vs_T0 <- function(s) {
+  lfc <- L[, s] - L[, "LPS853_T0"]
+  lfc <- lfc - median(lfc[is_nt])
+  tapply(lfc, counts$gene, mean)
+}
+
+ess_qc <- lapply(samples[-1], function(s) {
+  g  <- gene_lfc_vs_T0(s)
+  ge <- g[names(g) %in% essential]
+  gn <- g[names(g) %in% nonessential]
+  r  <- roc(response  = c(rep(1, length(ge)), rep(0, length(gn))),
+            predictor = c(ge, gn), direction = ">", quiet = TRUE)   # lower LFC = essential
+  list(sample = s, roc = r, ge = ge, gn = gn,
+       stats = data.frame(sample = s,
+                          AUC = round(as.numeric(auc(r)), 3),
+                          NNMD = round((mean(ge) - mean(gn)) / sd(gn), 2),
+                          mean_LFC_essential = round(mean(ge), 2),
+                          mean_LFC_nonessential = round(mean(gn), 2)))
+})
+names(ess_qc) <- samples[-1]
+do.call(rbind, lapply(ess_qc, `[[`, "stats"))
+```
+
+```{r roc-plot, fig.width = 10, fig.height = 4.2}
+# Histogram for DMSO vs T0
+dmso <- ess_qc[["LPS853_Ctrl"]]
+hist_df <- rbind(data.frame(LFC = dmso$gn, set = "Non-essential"),
+                 data.frame(LFC = dmso$ge, set = "Essential"))
+p_hist <- ggplot(hist_df, aes(LFC, fill = set)) +
+  geom_histogram(bins = 60, position = "identity", alpha = 0.85) +
+  scale_fill_manual(values = c("Essential" = col_sens, "Non-essential" = "grey65")) +
+  labs(title = "DMSO vs T0", x = "Gene mean log2FC", y = "Genes", fill = NULL) +
+  theme(legend.position = c(0.25, 0.85))
+
+# ROC curves for all arms
+roc_df <- do.call(rbind, lapply(ess_qc, function(z) {
+  data.frame(sample = sub("LPS853_", "", z$sample),
+             FPR = 1 - z$roc$specificities, TPR = z$roc$sensitivities)
+}))
+roc_df$sample <- factor(roc_df$sample, levels = c("Ctrl", "Palbo", "Dox", "Nut"),
+                        labels = c("DMSO", "Palbo", "Dox", "Nutlin"))
+auc_lab <- sapply(ess_qc, function(z) z$stats$AUC)
+p_roc <- ggplot(roc_df, aes(FPR, TPR, colour = sample)) +
+  geom_abline(linetype = 2, colour = "grey60") +
+  geom_path(linewidth = 0.7) +
+  scale_colour_manual(values = c("#1b1b1b", "#2a6fdb", "#d9661f", "#7a3fb0"),
+                      labels = paste0(c("DMSO", "Palbo", "Dox", "Nutlin"),
+                                      " (AUC ", auc_lab, ")")) +
+  coord_equal() +
+  labs(title = "Essential vs non-essential ROC (vs T0)",
+       x = "False positive rate (non-essential)", y = "True positive rate (essential)",
+       colour = NULL) +
+  theme(legend.position = c(0.65, 0.2))
+
+p_hist + p_roc
+```
+
+The essential-gene mean LFC is weaker in the drug arms (about −1.4) than in DMSO (−1.73). That
+means the drug-treated cells went through fewer doublings. This matters for step 4.
+
+# 3. Helper: abundance-matched guide Z and gene score
+
+Low-count guides are noisier. Each guide's LFC is therefore divided by the SD of guides with
+similar DMSO abundance, using a sliding window of `sd_window` guides sorted by DMSO log count.
+Gene Z is `sum(guide z) / sqrt(n guides)`, the same approach as drugZ. The growth correction
+uses a robust (bisquare) regression line fitted on all guides.
+
+```{r helpers}
+# Sliding-window SD (centred; window shrinks at the edges), sample SD (n-1)
+rolling_sd <- function(x, w) {
+  n <- length(x); h <- (w - 1) %/% 2
+  cs  <- c(0, cumsum(x)); cs2 <- c(0, cumsum(x^2))
+  lo  <- pmax(1, seq_len(n) - h); hi <- pmin(n, seq_len(n) + h)
+  k   <- hi - lo + 1
+  s1  <- cs[hi + 1] - cs[lo]; s2 <- cs2[hi + 1] - cs2[lo]
+  sqrt((s2 - s1^2 / k) / (k - 1))
+}
+
+gene_z <- function(lfc, abundance, gene, w = sd_window) {
+  o  <- order(abundance)
+  sd <- numeric(length(lfc)); sd[o] <- rolling_sd(lfc[o], w)
+  z  <- lfc / sd
+  data.frame(gene = gene, z = z, lfc = lfc) |>
+    group_by(gene) |>
+    summarise(n_sgRNA = n(), LFC = mean(lfc), Z = sum(z) / sqrt(n()), .groups = "drop")
+}
+
+# Robust straight-line fit (Tukey bisquare M-estimator) on ALL guides.
+# Guides with real drug effects are outliers and get down-weighted, so the line
+# describes the bulk "same biology, fewer doublings" relationship. Deterministic.
+robust_fit <- function(x, y) {
+  f <- rlm(y ~ x, psi = psi.bisquare, maxit = 100)
+  c(slope = unname(coef(f)[2]), intercept = unname(coef(f)[1]))
+}
+```
+
+# 4. Drug vs DMSO
+
+## 4.1 Filter and set up log fold changes
+
+```{r filter}
+keep  <- counts$LPS853_T0 >= min_T0
+gene  <- counts$gene[keep]
+nt_k  <- is_nt[keep]
+Lk    <- L[keep, ]
+sum(keep); sum(!keep)
+
+centre <- function(v) v - median(v[nt_k])
+lfc_dmso_T0 <- centre(Lk[, "LPS853_Ctrl"] - Lk[, "LPS853_T0"])   # baseline fitness effect
+abund_dmso  <- Lk[, "LPS853_Ctrl"]
+```
+
+## 4.2 Why a growth correction is needed
+
+Plotting drug-vs-T0 against DMSO-vs-T0 for every guide shows a slope below 1. Essential-gene guides
+dropped out less in the drug arms because those cells divided fewer times. A naive "drug minus DMSO"
+comparison therefore makes essential genes look like *resistance* hits. This explains why
+GINS2, CIAO1 and ribosomal genes top the paper's resistance lists.
+
+```{r growth, fig.width = 10, fig.height = 3.6}
+arms <- c(Palbo = "LPS853_Palbo", Dox = "LPS853_Dox", Nutlin = "LPS853_Nut")
+paper_col <- c(Palbo = "Score_palbo", Dox = "Score_dox", Nutlin = "Score_nutlin")
+
+fits <- lapply(arms, function(s) {
+  y   <- centre(Lk[, s] - Lk[, "LPS853_T0"])
+  list(y = y, fit = robust_fit(lfc_dmso_T0, y))
+})
+sapply(fits, function(f) round(f$fit, 3))
+
+gp <- lapply(names(fits), function(k) {
+  f  <- fits[[k]]
+  df <- data.frame(x = lfc_dmso_T0, y = f$y)[sample(length(f$y), 15000), ]
+  ggplot(df, aes(x, y)) +
+    geom_point(size = 0.3, alpha = 0.3) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey50") +
+    geom_abline(slope = f$fit["slope"], intercept = f$fit["intercept"],
+                colour = col_res, linewidth = 0.8) +
+    labs(title = sprintf("%s (slope %.2f)", k, f$fit["slope"]),
+         x = "DMSO vs T0 log2FC", y = paste(k, "vs T0 log2FC"))
+})
+wrap_plots(gp, nrow = 1)
+```
+
+## 4.3 Gene scores
+
+For each drug, this chunk computes:
+
+* `LFC_vs_DMSO`, `Z_raw`: direct drug-vs-DMSO comparison, comparable to the paper's MAGeCK score
+* `LFC_adj`, `Z_adj`: the growth-corrected residual (**the main result**)
+* `p_sens` / `FDR_sens`: depleted in drug, meaning knockout sensitises
+* `p_res` / `FDR_res`: enriched in drug, meaning knockout gives resistance
+
+```{r scores}
+dmso_T0_gene <- tapply(lfc_dmso_T0, gene, mean)
+
+results <- lapply(names(arms), function(k) {
+  s   <- arms[[k]]
+  raw <- centre(Lk[, s] - Lk[, "LPS853_Ctrl"])
+  adj <- fits[[k]]$y - (fits[[k]]$fit["slope"] * lfc_dmso_T0 + fits[[k]]$fit["intercept"])
+
+  R <- gene_z(raw, abund_dmso, gene)
+  A <- gene_z(adj, abund_dmso, gene)
+
+  out <- data.frame(gene = A$gene, n_sgRNA = A$n_sgRNA,
+                    DMSO_vs_T0_LFC = as.numeric(dmso_T0_gene[A$gene]),
+                    LFC_vs_DMSO = R$LFC[match(A$gene, R$gene)],
+                    Z_raw       = R$Z[match(A$gene, R$gene)],
+                    LFC_adj = A$LFC, Z_adj = A$Z) |>
+    filter(gene != "NonTargeting") |>
+    mutate(p_sens   = pnorm(Z_adj),
+           p_res    = pnorm(Z_adj, lower.tail = FALSE),
+           FDR_sens = p.adjust(p_sens, "BH"),
+           FDR_res  = p.adjust(p_res,  "BH"),
+           paper_MAGeCK_score = mageck[[paper_col[[k]]]][match(gene, mageck$Gene)],
+           likely_artefact_essential = DMSO_vs_T0_LFC < -1) |>
+    arrange(Z_adj)
+  out
+})
+names(results) <- names(arms)
+
+# Hit counts and agreement with the paper's MAGeCK scores
+data.frame(
+  arm        = names(results),
+  sens_FDR10 = sapply(results, function(r) sum(r$FDR_sens < fdr_cut)),
+  res_FDR10  = sapply(results, function(r) sum(r$FDR_res  < fdr_cut)),
+  rho_raw_vs_paper = sapply(results, function(r)
+    round(cor(r$Z_raw, r$paper_MAGeCK_score, method = "spearman", use = "complete"), 3)),
+  rho_adj_vs_paper = sapply(results, function(r)
+    round(cor(r$Z_adj, r$paper_MAGeCK_score, method = "spearman", use = "complete"), 3))
+)
+```
+
+## 4.4 Top hits per arm
+
+```{r tophits}
+show_cols <- c("gene", "DMSO_vs_T0_LFC", "LFC_vs_DMSO", "LFC_adj", "Z_adj",
+               "FDR_sens", "FDR_res", "paper_MAGeCK_score")
+for (k in names(results)) {
+  cat("\n###", k, "— top sensitising\n")
+  print(head(results[[k]][show_cols], 15), digits = 3, row.names = FALSE)
+  cat("\n###", k, "— top resistance\n")
+  print(head(results[[k]][order(-results[[k]]$Z_adj), show_cols], 10), digits = 3, row.names = FALSE)
+}
+```
+
+Genes with `DMSO_vs_T0_LFC < -1` are strong essentials with few reads left. When they appear as
+hits (for example COPA, DNAJC17 and PRKRA, which show up in all three arms), treat them with caution.
+
+```{r shared}
+Reduce(intersect, lapply(results, function(r) r$gene[r$FDR_sens < fdr_cut]))
+```
+
+## 4.5 How much do hits depend on the growth-correction slope?
+
+The slope is estimated, not known. Re-scoring at slope ±0.03 shows which hits are robust.
+The number of *sensitising* hits is very sensitive to the slope: a slightly lower slope pushes
+many essential genes past the threshold. The strongest hits stay put, though. Trust genes that
+remain significant across the whole range more than the exact hit counts.
+
+```{r slope-sensitivity}
+score_at_slope <- function(k, b) {
+  y   <- fits[[k]]$y
+  adj <- y - (b * lfc_dmso_T0 + fits[[k]]$fit["intercept"])   # same form as section 4.3
+  A   <- gene_z(adj, abund_dmso, gene) |> filter(gene != "NonTargeting")
+  A$FDR_sens <- p.adjust(pnorm(A$Z), "BH")
+  A$FDR_res  <- p.adjust(pnorm(A$Z, lower.tail = FALSE), "BH")
+  A
+}
+sens_tab <- do.call(rbind, lapply(names(arms), function(k) {
+  b0 <- fits[[k]]$fit["slope"]
+  do.call(rbind, lapply(c(-0.03, 0, 0.03), function(d) {
+    A <- score_at_slope(k, b0 + d)
+    data.frame(arm = k, slope = round(b0 + d, 3),
+               sens_FDR10 = sum(A$FDR_sens < fdr_cut), res_FDR10 = sum(A$FDR_res < fdr_cut))
+  }))
+}))
+sens_tab
+
+# Sensitising hits found at all three slopes
+robust_hits <- lapply(names(arms), function(k) {
+  b0 <- fits[[k]]$fit["slope"]
+  Reduce(intersect, lapply(c(-0.03, 0, 0.03), function(d) {
+    A <- score_at_slope(k, b0 + d); A$gene[A$FDR_sens < fdr_cut] }))
+})
+names(robust_hits) <- names(arms)
+lengths(robust_hits)
+for (k in names(robust_hits)) {
+  r <- results[[k]]; r <- r[r$gene %in% robust_hits[[k]] & !r$likely_artefact_essential, ]
+  cat(k, ": ", paste(head(r$gene, 20), collapse = ", "), "\n", sep = "")
+}
+```
+
+# 5. Pathway check: NHEJ
+
+The test uses Stouffer's method on gene Z_adj. A negative value means the whole set sensitises.
+
+```{r nhej}
+nhej <- c("PRKDC", "XRCC4", "XRCC5", "XRCC6", "LIG4", "NHEJ1", "DCLRE1C")
+do.call(rbind, lapply(names(results), function(k) {
+  z <- results[[k]]$Z_adj[match(nhej, results[[k]]$gene)]; z <- z[!is.na(z)]
+  sz <- sum(z) / sqrt(length(z))
+  data.frame(arm = k, n = length(z), mean_Z = round(mean(z), 2),
+             set_Z = round(sz, 2), p_sensitising = signif(pnorm(sz), 3))
+}))
+
+panel <- c(nhej, "TDP2", "TP53BP1", "ATM", "ABCC1", "TOP2A", "TOP2B",
+           "RB1", "CDK2", "CCNE1", "CDKN2A", "TP53", "CDKN1A", "MDM2", "USP28")
+panel_tab <- sapply(results, function(r) round(r$Z_adj[match(panel, r$gene)], 2))
+rownames(panel_tab) <- panel
+panel_tab
+```
+
+```{r heat, fig.width = 4.5, fig.height = 6}
+hm <- as.data.frame(as.table(panel_tab)); names(hm) <- c("gene", "arm", "Z")
+hm$gene <- factor(hm$gene, levels = rev(panel))
+lim <- 8
+ggplot(hm, aes(arm, gene, fill = pmax(pmin(Z, lim), -lim))) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.1f", Z)), size = 2.8) +
+  scale_fill_gradient2(low = col_sens, mid = "grey95", high = col_res,
+                       limits = c(-lim, lim), name = "Z_adj\n(capped ±8)") +
+  labs(x = NULL, y = NULL, title = "Selected genes (growth-corrected Z)")
+```
+
+# 6. Rank plots
+
+```{r rankplots, fig.width = 13, fig.height = 4.5}
+lab_genes <- list(
+  Palbo  = c("RB1", "CDKN2A", "FZR1", "CDKN1A", "TP53", "CDK2", "CCNE1", "E2F3", "KEAP1", "CKS1B"),
+  Dox    = c("TP53", "CDKN1A", "SMAD4", "PRKDC", "XRCC4", "TDP2", "ABCC1", "XRCC6", "NHEJ1", "LIG4"),
+  Nutlin = c("TP53", "CDKN1A", "USP28", "TP53BP1", "ATM", "SLC33A1", "SBDS", "OBFC1"))
+
+rank_plot <- function(k) {
+  r <- results[[k]] |>
+    mutate(rank = rank(Z_adj, ties.method = "first"),
+           class = case_when(FDR_sens < fdr_cut ~ "Sensitising",
+                             FDR_res  < fdr_cut ~ "Resistance",
+                             TRUE ~ "NS"))
+  ggplot(r, aes(rank, Z_adj)) +
+    geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.3) +
+    geom_point(data = filter(r, class == "NS"), colour = col_ns, size = 0.3) +
+    geom_point(data = filter(r, class != "NS"), aes(colour = class), size = 1) +
+    geom_text_repel(data = filter(r, gene %in% lab_genes[[k]]), aes(label = gene),
+                    size = 2.8, min.segment.length = 0, segment.size = 0.3,
+                    nudge_x = ifelse(filter(r, gene %in% lab_genes[[k]])$Z_adj > 0, -4000, 4000),
+                    direction = "y", max.overlaps = Inf) +
+    scale_colour_manual(values = c(Sensitising = col_sens, Resistance = col_res)) +
+    annotate("text", x = 0, y = max(r$Z_adj), hjust = 0, vjust = 1, size = 3,
+             label = sprintf("Sensitising FDR<%.1f: %d\nResistance FDR<%.1f: %d",
+                             fdr_cut, sum(r$class == "Sensitising"),
+                             fdr_cut, sum(r$class == "Resistance"))) +
+    labs(title = paste(k, "vs DMSO (growth-corrected)"), x = "Gene rank", y = "Gene Z") +
+    theme(legend.position = "none")
+}
+wrap_plots(lapply(names(results), rank_plot), nrow = 1)
+```
+
+Raw versus corrected scores for Dox show how the correction moves essential genes out of the
+"resistance" side:
+
+```{r rawvsadj, fig.width = 5.5, fig.height = 4.5}
+r <- results$Dox
+ggplot(r, aes(Z_raw, Z_adj, colour = DMSO_vs_T0_LFC < -1)) +
+  geom_point(size = 0.4, alpha = 0.5) +
+  geom_abline(linetype = 2, colour = "grey50") +
+  scale_colour_manual(values = c(`FALSE` = "grey60", `TRUE` = col_sens),
+                      labels = c("Other", "Strong essential (DMSO vs T0 < -1)"), name = NULL) +
+  labs(title = "Dox: raw vs growth-corrected gene Z", x = "Z raw (drug vs DMSO)", y = "Z adjusted") +
+  theme(legend.position = "bottom")
+```
+
+# 7. Export
+
+```{r export}
+wb <- createWorkbook()
+addWorksheet(wb, "QC")
+writeData(wb, "QC", cbind(qc_tab, size_factor = round(size_factors, 3)))
+writeData(wb, "QC", do.call(rbind, lapply(ess_qc, `[[`, "stats")), startRow = 9)
+addWorksheet(wb, "Gene panel (Z_adj)")
+writeData(wb, "Gene panel (Z_adj)", panel_tab, rowNames = TRUE)
+for (k in names(results)) {
+  sh <- paste(k, "vs DMSO"); addWorksheet(wb, sh)
+  writeData(wb, sh, results[[k]]); freezePane(wb, sh, firstRow = TRUE, firstCol = TRUE)
+}
+saveWorkbook(wb, "LPS853_CRISPR_drug_vs_DMSO_results_R.xlsx", overwrite = TRUE)
+
+ggsave("LPS853_rankplots.png", wrap_plots(lapply(names(results), rank_plot), nrow = 1),
+       width = 13, height = 4.5, dpi = 200)
+ggsave("LPS853_QC_ROC.png", p_hist + p_roc, width = 10, height = 4.2, dpi = 200)
+```
+
+# Session info
+
+```{r session}
+sessionInfo()
+```
